@@ -1,7 +1,7 @@
 package main
 
 import (
-	"archive/zip"
+	"encoding/xml"
 	"fmt"
 	"io"
 
@@ -10,33 +10,85 @@ import (
 	"github.com/taylorskalyo/goreader/epub"
 )
 
-func EpubToMarkdown(path string) error {
-	zr, err := zip.OpenReader(path)
-	if err != nil {
-		return err
+type Chapter struct {
+	Title string
+	Path  string
+	Src   string
+}
+
+type NavMap struct {
+	Points []Nav `xml:"navMap>navPoint"`
+}
+
+type Nav struct {
+	Title   string `xml:"navLabel>text"`
+	Content struct {
+		Src string `xml:"src,attr"`
+	} `xml:"content"`
+	Points []Nav `xml:"navPoint"`
+}
+
+func (n Nav) Flatten() []Chapter {
+	if len(n.Points) == 0 {
+		return []Chapter{{Path: n.Title, Title: n.Title, Src: n.Content.Src}}
 	}
-	rc, err := epub.OpenReader(path)
-	if err != nil {
-		return err
+	chapters := make([]Chapter, 0, len(n.Points))
+	for _, p := range n.Points {
+		children := p.Flatten()
+		for i, child := range children {
+			children[i].Path = n.Title + " > " + child.Path
+		}
+		chapters = append(chapters, children...)
 	}
-	defer rc.Close()
+	return chapters
+}
+
+func parseTOC(rc *epub.ReadCloser) ([]Nav, error) {
+	toc := []Nav{}
 	for _, book := range rc.Rootfiles {
 		for _, item := range book.Items {
 			if item.ID == "ncx" {
 				r, err := item.Open()
 				if err != nil {
-					return err
+					return nil, err
 				}
 				defer r.Close()
-				_, err = io.ReadAll(r)
+				b, err := io.ReadAll(r)
 				if err != nil {
-					return err
+					return nil, err
 				}
-				// fmt.Println(string(b))
+				m := NavMap{}
+				if err := xml.Unmarshal(b, &m); err != nil {
+					return nil, err
+				}
+				toc = append(toc, m.Points...)
 			}
 		}
+	}
+	return toc, nil
+}
+
+func EpubToMarkdown(path string) error {
+	rc, err := epub.OpenReader(path)
+	if err != nil {
+		return err
+	}
+	defer rc.Close()
+	toc, err := parseTOC(rc)
+	if err != nil {
+		return err
+	}
+	for _, c := range toc {
+		for _, chap := range c.Flatten() {
+			fmt.Printf("%#v\n", chap)
+		}
+	}
+	itemMap := make(map[string]epub.Item)
+	for _, book := range rc.Rootfiles {
+		for _, item := range book.Items {
+			itemMap[item.HREF] = item
+		}
 		for _, itemRef := range book.Spine.Itemrefs {
-			fmt.Println(itemRef.IDREF)
 			r, err := itemRef.Open()
 			if err != nil {
 				return err

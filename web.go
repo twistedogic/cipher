@@ -7,16 +7,16 @@ import (
 	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
 )
 
-func SiteToMarkdown(link string) error {
+func SiteToMarkdown(link string) (*Content, error) {
 	res, err := http.Get(link)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer res.Body.Close()
 	md, err := htmltomarkdown.ConvertReader(res.Body)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	fmt.Println(string(md))
-	return nil
+	return nil, nil
 }
