@@ -4,16 +4,34 @@ import (
 	"encoding/xml"
 	"fmt"
 	"io"
+	"net/url"
 
 	htmltomarkdown "github.com/JohannesKaufmann/html-to-markdown/v2"
+	"github.com/PuerkitoBio/goquery"
 	"github.com/charmbracelet/glamour"
 	"github.com/taylorskalyo/goreader/epub"
 )
 
 type Chapter struct {
-	Title string
-	Path  string
-	Src   string
+	Title      string
+	Path       string
+	Src        string
+	prev, next *Chapter
+	Content    []byte
+}
+
+func (c *Chapter) String() string {
+	if c == nil {
+		return "No content."
+	}
+	md, err := htmltomarkdown.ConvertString(string(c.Content))
+	if err != nil {
+		return string(c.Content)
+	}
+	if pretty, err := glamour.Render(md, "dark"); err == nil {
+		return pretty
+	}
+	return string(c.Content)
 }
 
 type NavMap struct {
@@ -28,13 +46,40 @@ type Nav struct {
 	Points []Nav `xml:"navPoint"`
 }
 
-func (n Nav) Flatten() []Chapter {
-	if len(n.Points) == 0 {
-		return []Chapter{{Path: n.Title, Title: n.Title, Src: n.Content.Src}}
+func readContent(src string, itemMap map[string]epub.Item) ([]byte, error) {
+	u, err := url.Parse(src)
+	if err != nil {
+		return nil, err
 	}
-	chapters := make([]Chapter, 0, len(n.Points))
+	item, ok := itemMap[u.Path]
+	if !ok {
+		return nil, fmt.Errorf("item not found for %q", u.Path)
+	}
+	r, err := item.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer r.Close()
+	if u.Fragment == "" {
+		return io.ReadAll(r)
+	}
+	doc, err := goquery.NewDocumentFromReader(r)
+	if err != nil {
+		return nil, err
+	}
+	html, err := doc.Find("#" + u.Fragment).First().Html()
+	return []byte(html), err
+}
+
+func (n Nav) toChapter() *Chapter {
+	return &Chapter{Path: n.Title, Title: n.Title, Src: n.Content.Src}
+}
+
+func (n Nav) flatten() []*Chapter {
+	chapters := make([]*Chapter, 0, len(n.Points)+1)
+	chapters = append(chapters, n.toChapter())
 	for _, p := range n.Points {
-		children := p.Flatten()
+		children := p.flatten()
 		for i, child := range children {
 			children[i].Path = n.Title + " > " + child.Path
 		}
@@ -68,6 +113,16 @@ func parseTOC(rc *epub.ReadCloser) ([]Nav, error) {
 	return toc, nil
 }
 
+func mapItems(rc *epub.ReadCloser) map[string]epub.Item {
+	itemMap := make(map[string]epub.Item)
+	for _, book := range rc.Rootfiles {
+		for _, item := range book.Items {
+			itemMap[item.HREF] = item
+		}
+	}
+	return itemMap
+}
+
 func EpubToMarkdown(path string) error {
 	rc, err := epub.OpenReader(path)
 	if err != nil {
@@ -79,33 +134,8 @@ func EpubToMarkdown(path string) error {
 		return err
 	}
 	for _, c := range toc {
-		for _, chap := range c.Flatten() {
-			fmt.Printf("%#v\n", chap)
-		}
-	}
-	itemMap := make(map[string]epub.Item)
-	for _, book := range rc.Rootfiles {
-		for _, item := range book.Items {
-			itemMap[item.HREF] = item
-		}
-		for _, itemRef := range book.Spine.Itemrefs {
-			r, err := itemRef.Open()
-			if err != nil {
-				return err
-			}
-			defer r.Close()
-			b, err := io.ReadAll(r)
-			if err != nil {
-				return err
-			}
-			md, err := htmltomarkdown.ConvertString(string(b))
-			if err != nil {
-				return err
-			}
-			_, err = glamour.Render(md, "dark")
-			if err != nil {
-				return err
-			}
+		for _, chap := range c.flatten() {
+			fmt.Println(chap.Title, chap)
 		}
 	}
 	return nil
