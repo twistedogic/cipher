@@ -123,20 +123,20 @@ func mapItems(rc *epub.ReadCloser) map[string]epub.Item {
 	return itemMap
 }
 
-func EpubToMarkdown(path string) error {
+func FromEpub(path string) ([]*Document, error) {
 	rc, err := epub.OpenReader(path)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rc.Close()
 	toc, err := parseTOC(rc)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	for _, c := range toc {
 		for _, chap := range c.flatten() {
 			fmt.Println(chap.Title, chap)
 		}
 	}
-	return nil
+	return nil, nil
 }
