@@ -1,6 +1,10 @@
 package main
 
-import "time"
+import (
+	"time"
+
+	"github.com/charmbracelet/glamour"
+)
 
 const (
 	WebType  = "web"
@@ -45,4 +49,11 @@ func (m Metadata) toMap() map[string]string {
 type Document struct {
 	Metadata Metadata
 	Content  []byte
+}
+
+func (d Document) String() string {
+	if md, err := glamour.RenderBytes(d.Content, "dark"); err == nil {
+		return string(md)
+	}
+	return string(d.Content)
 }

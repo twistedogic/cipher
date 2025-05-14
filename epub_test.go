@@ -3,6 +3,7 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -13,7 +14,7 @@ func Test_EpubToMarkdown(t *testing.T) {
 	files, err := os.ReadDir("testdata")
 	require.NoError(t, err)
 	for _, file := range files {
-		if filepath.Ext(file.Name()) != "epub" {
+		if !strings.HasSuffix(file.Name(), ".epub") {
 			continue
 		}
 		t.Run(file.Name(), func(t *testing.T) {
