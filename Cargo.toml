@@ -1,0 +1,10 @@
+[package]
+name = "cipher"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+epub = "1.2.0"
+html2md = "0.2.15"
+clap = { version = "4.4.8", features = ["derive"] }
+anyhow = "1.0.75"
