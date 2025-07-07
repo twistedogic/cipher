@@ -7,14 +7,15 @@ fn get_target_debug_path() -> PathBuf {
     let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     path.push("target");
     path.push("debug");
-    path.push("epub_to_markdown_rs"); // Name of the executable
+    path.push("cipher"); // Updated name of the executable
     path
 }
 
 
 #[test]
 fn test_epub_to_markdown_conversion() -> Result<()> {
-    let test_data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).parent().unwrap().join("testdata");
+    // CARGO_MANIFEST_DIR is now the project root.
+    let test_data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
     let executable_path = get_target_debug_path();
 
     // Ensure the executable exists (it should after a build)

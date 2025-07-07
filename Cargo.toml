@@ -1,5 +1,5 @@
 [package]
-name = "epub_to_markdown_rs"
+name = "cipher"
 version = "0.1.0"
 edition = "2021"
 
