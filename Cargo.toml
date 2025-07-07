@@ -8,3 +8,22 @@ epub = "1.2.0"
 html2md = "0.2.15"
 clap = { version = "4.4.8", features = ["derive"] }
 anyhow = "1.0.75"
+# For Markdown parsing and chunking
+pulldown-cmark = "0.9.3" # Explicit version, aligned with a common known good one
+
+# For text embeddings (now using Ollama)
+ollama-rs = "0.1.7" # Check for latest appropriate version
+
+# For embedded vector store
+lancedb = "0.4.2" # As researched
+
+# Need tokio for async operations
+tokio = { version = "1.35.1", features = ["full"] } # More specific recent tokio
+futures = "0.3.30" # More specific recent futures
+
+# Other existing dependencies
+# epub = "1.2.0" # Already present
+# html2md = "0.2.15" # Already present
+# clap = { version = "4.4.8", features = ["derive"] } # Already present
+# anyhow = "1.0.75" # Already present
+# pulldown-cmark = "0.9.3" # Already present
