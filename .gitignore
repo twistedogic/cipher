@@ -25,6 +25,3 @@ go.work.sum
 .env
 
 .DS_Store
-
-# Rust target directory
-target/
