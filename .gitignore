@@ -26,5 +26,4 @@ go.work.sum
 
 .DS_Store
 
-# Rust target directory
-epub_to_markdown_rs/target/
+target/
