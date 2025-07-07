@@ -1,22 +1,37 @@
 use anyhow::{Context, Result};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use epub::doc::EpubDoc;
 use ollama_rs::generation::embeddings::EmbeddingsRequest;
-use ollama_rs::Ollama; // Added Ollama
-use std::path::{Path, PathBuf}; // For generating embeddings
+use ollama_rs::Ollama;
+use std::path::{Path, PathBuf};
 
-// LanceDB specific imports
-use arrow_array::{FixedSizeListArray, Float32Array, RecordBatch, StringArray}; // For creating RecordBatch
-use arrow_schema::{DataType, Field, Schema}; // For schema definition
+use arrow_array::{FixedSizeListArray, Float32Array, Int32Array, RecordBatch, StringArray}; // Corrected Int32Array import
+use arrow_schema::{DataType, Field, Schema};
 use lancedb::connection::Connection;
-use lancedb::table::NewTableBuilder; // For schema definition and table creation
-use std::sync::Arc; // For Arc<Schema> and Arc<Field>
+use lancedb::table::NewTableBuilder;
+use std::sync::Arc;
 
-const EMBEDDING_DIM: i32 = 384; // For AllMiniLmL6V2
-
+// Structure for top-level CLI
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
-struct Args {
+#[clap(propagate_version = true)]
+struct Cli {
+    #[clap(subcommand)]
+    command: Commands,
+}
+
+// Enum for subcommands
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Ingest an EPUB file into the vector store
+    Ingest(IngestArgs),
+    /// Query the vector store using RAG
+    Query(QueryArgs),
+}
+
+// Arguments for the Ingest subcommand
+#[derive(Parser, Debug)]
+struct IngestArgs {
     /// Path to the EPUB file
     #[clap(short, long)]
     epub_path: String,
@@ -33,21 +48,56 @@ struct Args {
     #[clap(long, default_value = "http://localhost:11434")]
     ollama_url: String,
 
-    /// Ollama embedding model name
+    /// Ollama embedding model name (e.g., nomic-embed-text)
     #[clap(long, default_value = "nomic-embed-text")]
-    ollama_model: String,
+    ollama_embedding_model: String,
 
-    /// Embedding dimension for the chosen Ollama model
-    #[clap(long)] // Making it mandatory for now, user must specify
+    /// Embedding dimension for the chosen Ollama embedding model
+    #[clap(long)]
     embedding_dim: i32,
 }
 
-async fn process_epub_and_embed(args: Args, ollama: Arc<Ollama>) -> Result<()> {
+// Arguments for the Query subcommand
+#[derive(Parser, Debug)]
+struct QueryArgs {
+    /// The user's query
+    #[clap(short, long)]
+    query: String,
+
+    /// Path to the LanceDB database directory
+    #[clap(short, long, default_value = ".lancedb")]
+    db_path: String,
+
+    /// Table name in LanceDB
+    #[clap(short, long, default_value = "epub_chunks")]
+    table_name: String,
+
+    /// Ollama server base URL (e.g., http://localhost:11434)
+    #[clap(long, default_value = "http://localhost:11434")]
+    ollama_url: String,
+
+    /// Ollama embedding model name (for embedding the query)
+    #[clap(long, default_value = "nomic-embed-text")]
+    ollama_embedding_model: String,
+
+    /// Embedding dimension for the Ollama embedding model (must match ingested data)
+    #[clap(long)]
+    embedding_dim: i32,
+
+    /// Ollama generation model name (e.g., llama3, mistral)
+    #[clap(long, default_value = "llama3")] // Or another sensible default
+    ollama_generation_model: String,
+
+    /// Number of top-K chunks to retrieve for context
+    #[clap(short = 'k', long, default_value_t = 3)]
+    top_k: usize,
+}
+
+async fn process_epub_and_embed(args: IngestArgs, ollama: Arc<Ollama>) -> Result<()> {
     let epub_path = Path::new(&args.epub_path);
     let mut doc = EpubDoc::new(epub_path)
         .map_err(|e| anyhow::anyhow!("Failed to open EPUB file '{}': {}", args.epub_path, e))?;
 
-    // Connect to LanceDB
     let db_uri = PathBuf::from(&args.db_path);
     if !db_uri.exists() {
         std::fs::create_dir_all(&db_uri)
@@ -56,7 +106,6 @@ async fn process_epub_and_embed(args: Args, ollama: Arc<Ollama>) -> Result<()> {
     let conn = Connection::connect(&db_uri.to_string_lossy()).await?;
     println!("Connected to LanceDB at {:?}", db_uri);
 
-    // Define schema for LanceDB table
     let schema = Arc::new(Schema::new(vec![
         Field::new("text", DataType::Utf8, false),
         Field::new(
@@ -68,28 +117,24 @@ async fn process_epub_and_embed(args: Args, ollama: Arc<Ollama>) -> Result<()> {
             true,
         ),
         Field::new("source_epub", DataType::Utf8, true),
-        Field::new("chapter_idx", DataType::Int32, true), // Using Int32 for chapter index
-        Field::new("chunk_idx_in_chapter", DataType::Int32, true), // Using Int32 for chunk index
+        Field::new("chapter_idx", DataType::Int32, true),
+        Field::new("chunk_idx_in_chapter", DataType::Int32, true),
     ]));
 
-    // Create or open table
-    // Try to open first, if it fails, create it.
     let tbl_result = conn.open_table(&args.table_name).await;
     let mut tbl = match tbl_result {
         Ok(table) => {
             println!("Opened existing table '{}'", args.table_name);
-            // Potentially verify schema compatibility here if needed
             table
         }
         Err(_) => {
             println!("Table '{}' not found, creating new one.", args.table_name);
-            NewTableBuilder::new(conn.clone(), &args.table_name, schema.clone())
+            NewTableBuilder::new(conn.clone(), &args.table_name, schema.clone()) // Pass cloned schema
                 .create()
                 .await?
         }
     };
 
-    // Metadata from EPUB
     let epub_filename = epub_path
         .file_name()
         .unwrap_or_default()
@@ -106,7 +151,7 @@ async fn process_epub_and_embed(args: Args, ollama: Arc<Ollama>) -> Result<()> {
     println!("\nProcessing content (spine items)...\n");
 
     for (chapter_idx_usize, spine_item_id) in spine_ids.iter().enumerate() {
-        let chapter_idx = chapter_idx_usize as i32; // Convert to i32 for schema
+        let chapter_idx = chapter_idx_usize as i32;
         match doc.get_resource(spine_item_id) {
             Ok(content_bytes_vec) => {
                 let html_content = String::from_utf8_lossy(&content_bytes_vec);
@@ -129,8 +174,6 @@ async fn process_epub_and_embed(args: Args, ollama: Arc<Ollama>) -> Result<()> {
                     continue;
                 }
 
-                // let chunk_strs: Vec<&str> = text_chunks.iter().map(String::as_str).collect(); // Not needed for one-by-one
-
                 println!(
                     "Generating embeddings for {} chunks via Ollama...",
                     text_chunks.len()
@@ -143,26 +186,21 @@ async fn process_epub_and_embed(args: Args, ollama: Arc<Ollama>) -> Result<()> {
                     if text_chunk.trim().is_empty() {
                         continue;
                     }
-                    // Generate embedding for each chunk individually
-                    // In future, ollama-rs might support batching for generate_embeddings.
-                    // For now, one by one.
-                    let request =
-                        EmbeddingsRequest::new(args.ollama_model.clone(), text_chunk.clone());
+                    let request = EmbeddingsRequest::new(
+                        args.ollama_embedding_model.clone(),
+                        text_chunk.clone(),
+                    );
                     match ollama.generate_embeddings(request).await {
                         Ok(response) => {
-                            // ollama-rs returns Vec<f64>, convert to Vec<f32> for LanceDB schema
                             let embedding_f32: Vec<f32> =
                                 response.embeddings.iter().map(|&x| x as f32).collect();
-
-                            // TODO: Check embedding_f32.len() against EMBEDDING_DIM. This is crucial.
-                            // Validate embedding dimension before adding to batch
                             if embedding_f32.len() == args.embedding_dim as usize {
                                 current_embeddings_for_db.push(embedding_f32);
                                 current_texts_for_db.push(text_chunk.to_string());
                             } else {
                                 eprintln!(
                                     "Warning: Ollama model '{}' returned embedding of dimension {} for chunk '{}...', but CLI specified dimension {}. Skipping this chunk.",
-                                    args.ollama_model,
+                                    args.ollama_embedding_model,
                                     embedding_f32.len(),
                                     text_chunk.chars().take(30).collect::<String>(),
                                     args.embedding_dim
@@ -174,7 +212,6 @@ async fn process_epub_and_embed(args: Args, ollama: Arc<Ollama>) -> Result<()> {
                                 "Error generating Ollama embedding for chunk '{}': {:?}",
                                 text_chunk, e
                             );
-                            // Decide how to handle: skip chunk, use zero vector, etc. For now, skip.
                         }
                     }
                 }
@@ -199,42 +236,28 @@ async fn process_epub_and_embed(args: Args, ollama: Arc<Ollama>) -> Result<()> {
                             text_col_builder.append_value(text_chunk);
                             source_epub_col_builder.append_value(&epub_filename);
                             chapter_idx_col_builder.append_value(chapter_idx);
-                            chunk_idx_in_chapter_col_builder.append_value(idx as i32); // Use current index in this batch
+                            chunk_idx_in_chapter_col_builder.append_value(idx as i32);
 
                             let value_builder = embedding_col_builder.values();
+                            // This check is redundant if filtering during embedding generation worked perfectly
                             if embedding_f32.len() == args.embedding_dim as usize {
                                 for val in embedding_f32 {
                                     value_builder.append_value(*val);
                                 }
                                 embedding_col_builder.append(true);
                             } else {
-                                // This case should ideally be prevented by checks during embedding generation loop
-                                eprintln!(
-                                        "Critical Error: Embedding for chunk '{}...' has dimension {} but schema expects {}. This should not happen if pre-validated.",
-                                        text_chunk.chars().take(30).collect::<String>(),
-                                        embedding_f32.len(),
-                                        args.embedding_dim
-                                    );
-                                // This will likely lead to a panic when building the RecordBatch or inserting into LanceDB
-                                // if not all rows have consistent embedding lengths for FixedSizeList.
-                                // A more robust solution would be to filter out such rows *before* this stage.
-                                // For now, appending null or an empty list to make FixedSizeListBuilder happy if it supports it,
-                                // or more simply, ensure this condition is caught and handled earlier.
-                                // Let's assume the earlier embedding generation loop only adds correctly-dimensioned embeddings
-                                // to `current_embeddings_for_db`. If not, this part is problematic.
-                                // For this step, the focus is using args.embedding_dim.
-                                // The validation logic is in the embedding loop.
-                                // If an embedding of wrong dim got here, it's an issue with prior logic.
-                                // We will proceed assuming valid dimensions here from the previous loop.
-                                // If an invalid one sneaks through, LanceDB/Arrow will error out, which is an indicator.
-                                embedding_col_builder.append_null(); // This might be one way if the builder supports it for FixedSizeList
+                                // This case means an embedding with wrong dimension slipped through.
+                                // Appending null to maintain row consistency.
+                                eprintln!("Error: Mismatched embedding dimension at RecordBatch creation for chunk: {}. Expected {}, got {}. Appending null.", text_chunk.chars().take(30).collect::<String>(), args.embedding_dim, embedding_f32.len());
+                                embedding_col_builder.append_null();
                             }
                         }
                     }
 
                     if text_col_builder.len() > 0 {
+                        let batch_schema = schema.clone();
                         let record_batch = RecordBatch::try_new(
-                            schema.clone(),
+                            batch_schema,
                             vec![
                                 Arc::new(text_col_builder.finish()),
                                 Arc::new(embedding_col_builder.finish()),
@@ -242,7 +265,8 @@ async fn process_epub_and_embed(args: Args, ollama: Arc<Ollama>) -> Result<()> {
                                 Arc::new(chapter_idx_col_builder.finish()),
                                 Arc::new(chunk_idx_in_chapter_col_builder.finish()),
                             ],
-                        )?;
+                        )
+                        .with_context(|| "Failed to create RecordBatch")?;
 
                         tbl.add(Arc::new(record_batch), None).await?;
                         println!(
@@ -296,8 +320,6 @@ fn chunk_markdown(markdown: &str) -> Vec<String> {
                 }
                 current_chunk.clear();
             }
-            // Simplified: ignoring inline elements like Code, Html, SoftBreak, HardBreak etc. for now
-            // or assuming they are part of the text collected by Event::Text.
             _ => {}
         }
     }
@@ -309,28 +331,210 @@ fn chunk_markdown(markdown: &str) -> Vec<String> {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args = Args::parse();
+    let cli = Cli::parse();
 
-    // Initialize Ollama client once
-    println!("Initializing Ollama client with URL: {}", args.ollama_url);
-    let ollama = Arc::new(Ollama::from_url(args.ollama_url.clone()));
+    match cli.command {
+        Commands::Ingest(args) => {
+            println!(
+                "Initializing Ollama client for Ingest with URL: {}",
+                args.ollama_url
+            );
+            let ollama = Arc::new(Ollama::from_url(args.ollama_url.clone()));
+            process_epub_and_embed(args, ollama).await?;
+        }
+        Commands::Query(args) => {
+            println!(
+                "Initializing Ollama client for Query with URL: {}",
+                args.ollama_url
+            );
+            let ollama = Arc::new(Ollama::from_url(args.ollama_url.clone()));
+            handle_query_command(args, ollama).await?;
+        }
+    }
+    Ok(())
+}
 
-    // Optionally, check if the specified ollama_model is available on the server
-    // This requires an async call. For robustness, good to uncomment and test.
-    // let local_models = ollama.list_local_models().await?;
-    // if !local_models.iter().any(|m| m.name == args.ollama_model) {
-    //     return Err(anyhow::anyhow!("Ollama model '{}' not found on the server. Please pull it first.", args.ollama_model));
-    // }
-    // println!("Using Ollama model: {}", args.ollama_model);
+async fn handle_query_command(args: QueryArgs, ollama: Arc<Ollama>) -> Result<()> {
+    println!("Received query: '{}'", args.query);
+    println!(
+        "Using Ollama embedding model: {}",
+        args.ollama_embedding_model
+    );
+    println!("Expected embedding dimension: {}", args.embedding_dim);
 
-    process_epub_and_embed(args, ollama).await?;
+    // 1. Generate embedding for the query
+    let query_embedding_request =
+        EmbeddingsRequest::new(args.ollama_embedding_model.clone(), args.query.clone());
+    let query_embedding_response = ollama.generate_embeddings(query_embedding_request).await?;
+
+    let query_embedding_f64 = query_embedding_response.embeddings;
+    let query_embedding_f32: Vec<f32> = query_embedding_f64.iter().map(|&x| x as f32).collect();
+
+    if query_embedding_f32.len() != args.embedding_dim as usize {
+        return Err(anyhow::anyhow!(
+            "Query embedding dimension mismatch. Expected {}, got {}. Model: '{}'",
+            args.embedding_dim,
+            query_embedding_f32.len(),
+            args.ollama_embedding_model
+        ));
+    }
+
+    println!(
+        "Generated query embedding (first 3/{} dims): [{:.3}, {:.3}, {:.3}, ...]",
+        query_embedding_f32.len(),
+        query_embedding_f32.get(0).unwrap_or(&0.0),
+        query_embedding_f32.get(1).unwrap_or(&0.0),
+        query_embedding_f32.get(2).unwrap_or(&0.0)
+    );
+
+    // TODO:
+    // 2. Connect to LanceDB and open table (similar to ingest)
+    // 3. Perform similarity search using the query_embedding_f32
+    // 4. Retrieve top-K chunks
+    // 5. Formulate prompt with context and query
+    // 6. Call Ollama generation model
+    // 2. Connect to LanceDB and open table
+    let db_uri = PathBuf::from(&args.db_path);
+    let conn = Connection::connect(&db_uri.to_string_lossy())
+        .await
+        .with_context(|| format!("Failed to connect to LanceDB at {:?}", db_uri))?;
+
+    let tbl = conn.open_table(&args.table_name).await.with_context(|| {
+        format!(
+            "Failed to open table '{}' in LanceDB at {:?}",
+            args.table_name, db_uri
+        )
+    })?;
+
+    // 3. Perform similarity search
+    println!(
+        "Performing similarity search in LanceDB table '{}'...",
+        args.table_name
+    );
+    let search_results = tbl
+        .search(&query_embedding_f32) // Pass Vec<f32>
+        .limit(args.top_k)
+        .select(&["text", "source_epub", "chapter_idx", "chunk_idx_in_chapter"]) // Select columns to retrieve
+        .execute_stream() // Returns a stream of RecordBatch
+        .await
+        .with_context(|| "Failed to execute search query in LanceDB")?;
+
+    // The execute_stream() method returns a QueryResultStream which itself is a Stream of RecordBatch.
+    // We need to collect these results.
+    use futures::stream::TryStreamExt; // For try_collect
+    let record_batches: Vec<RecordBatch> = search_results
+        .try_collect()
+        .await
+        .with_context(|| "Failed to collect search results from LanceDB")?;
+
+    let mut retrieved_chunks_text: Vec<String> = Vec::new();
+
+    println!("\nRetrieved Chunks (Top {}):", args.top_k);
+    if record_batches.is_empty() {
+        println!("No chunks found matching the query.");
+    } else {
+        for batch in record_batches {
+            let text_array = batch
+                .column_by_name("text")
+                .ok_or_else(|| anyhow::anyhow!("'text' column not found in search results"))?
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("Failed to downcast 'text' column to StringArray")
+                })?;
+
+            // You can also retrieve other metadata columns like "source_epub", "chapter_idx" if needed
+            // let source_epub_array = batch.column_by_name("source_epub")...
+            // let chapter_idx_array = batch.column_by_name("chapter_idx")...
+
+            for i in 0..text_array.len() {
+                if retrieved_chunks_text.len() < args.top_k {
+                    // Ensure we don't exceed top_k due to batching
+                    let text_val = text_array.value(i).to_string();
+                    println!(
+                        "---\nChunk {}:\n{}\n---",
+                        retrieved_chunks_text.len() + 1,
+                        text_val
+                    );
+                    retrieved_chunks_text.push(text_val);
+                } else {
+                    break;
+                }
+            }
+            if retrieved_chunks_text.len() >= args.top_k {
+                break;
+            }
+        }
+    }
+
+    if retrieved_chunks_text.is_empty() {
+        println!("No relevant chunks found in the database for the query.");
+        // Decide if to proceed to LLM or not. For now, let's say we don't.
+        return Ok(());
+    }
+
+    // TODO:
+    // 4. (Done) Retrieve top-K chunks
+
+    // 5. Formulate prompt with context and query
+    // Prepare context from retrieved chunks
+    let context_string = retrieved_chunks_text.join("\n\n---\n\n"); // Simple join with separator
+
+    println!("\n--- Formulated Context for LLM ---");
+    println!("{}\n---------------------------------", context_string);
+
+    // 6. Formulate the prompt for the generation model
+    let prompt = format!(
+        "You are a helpful assistant. Answer the following question based only on the provided context. If the context does not contain the answer, state that you don't know based on the context provided.\n\nContext:\n---\n{}\n---\n\nQuestion: {}\n\nAnswer:",
+        context_string,
+        args.query
+    );
+
+    println!("\n--- Generated Prompt for LLM ---");
+    println!("{}\n--------------------------------", prompt);
+
+    // 7. Call Ollama generation model with this prompt
+    println!(
+        "\n--- Sending prompt to Ollama generation model: {} ---",
+        args.ollama_generation_model
+    );
+
+    // Depending on ollama-rs version, this might be `generate_chat_completion` or `generate_completion`
+    // For newer versions, it's often a specific request struct.
+    // Let's assume a simple completion for now, or adjust if using chat models specifically.
+    // ollama_rs::generation::completion::request::GenerationRequest is for completions.
+    // ollama_rs::generation::chat::request::ChatMessageRequest for chat.
+    // For a general prompt, GenerationRequest is usually suitable.
+    use ollama_rs::generation::completion::request::GenerationRequest;
+
+    let gen_request = GenerationRequest::new(args.ollama_generation_model.clone(), prompt.clone());
+    // Match on the result of sending the request
+    match ollama.generate_completion(gen_request).await {
+        Ok(response) => {
+            // Assuming response.response is the field containing the generated text.
+            // Check the specific structure of `GenerationResponse` from `ollama-rs`.
+            // For ollama-rs 0.1.7, it's likely `response.response`.
+            println!("\n--- LLM Response ---");
+            println!("{}", response.response);
+        }
+        Err(e) => {
+            eprintln!(
+                "Error generating response from Ollama model '{}': {:?}",
+                args.ollama_generation_model, e
+            );
+            // Optionally, return an error here or handle it as needed
+            // return Err(anyhow::anyhow!("Ollama generation failed: {}", e));
+        }
+    }
+
+    // 8. Print response (Done above)
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
+    // Unit tests for chunk_markdown
     #[test]
     fn test_chunk_markdown_empty() {
         let markdown = "";
@@ -349,9 +553,6 @@ mod tests {
     #[test]
     fn test_chunk_markdown_multiple_paragraphs() {
         let markdown = "Paragraph one.\n\nParagraph two.\n\nParagraph three.";
-        // html2md usually produces clean paragraphs, so pulldown-cmark should see them.
-        // Actual output of html2md might be <p>Paragraph one.</p><p>Paragraph two.</p>
-        // Let's assume pulldown cmark handles standard Markdown paragraph separation.
         let chunks = chunk_markdown(markdown);
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0], "Paragraph one.");
@@ -363,7 +564,6 @@ mod tests {
     fn test_chunk_markdown_with_headings() {
         let markdown = "# Heading 1\n\nParagraph under H1.\n\n## Heading 2\n\nParagraph under H2.";
         let chunks = chunk_markdown(markdown);
-        // Current chunking logic: heading text becomes a chunk, paragraph text becomes a chunk.
         assert_eq!(chunks.len(), 4);
         assert_eq!(chunks[0], "Heading 1");
         assert_eq!(chunks[1], "Paragraph under H1.");
@@ -373,27 +573,8 @@ mod tests {
 
     #[test]
     fn test_chunk_markdown_list_items() {
-        // The current chunker might treat the whole list as one chunk or list items individually
-        // if they contain paragraphs, or text between list markers.
-        // Let's test a simple list. The current logic will likely make the list content one chunk.
         let markdown = "* Item 1\n* Item 2\n* Item 3";
         let chunks = chunk_markdown(markdown);
-        // The refined chunker separates text blocks by Start/End of List/Heading/Paragraph
-        // Text nodes are collected.
-        // For "* Item 1\n* Item 2", pulldown-cmark produces:
-        // Start(List(None))
-        //  Start(Item)
-        //   Start(Paragraph)
-        //    Text("Item 1")
-        //   End(Paragraph)
-        //  End(Item)
-        //  Start(Item)
-        //   Start(Paragraph)
-        //    Text("Item 2")
-        //   End(Paragraph)
-        //  End(Item)
-        // End(List(None))
-        // So, "Item 1" and "Item 2" should become separate chunks due to End(Paragraph).
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[0], "Item 1");
         assert_eq!(chunks[1], "Item 2");
