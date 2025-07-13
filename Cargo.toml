@@ -8,3 +8,13 @@ epub = "1.2.0"
 html2md = "0.2.15"
 clap = { version = "4.4.8", features = ["derive"] }
 anyhow = "1.0.75"
+ollama-rs = { version = "0.1.5", features = ["tokio"] }
+tokio = { version = "1", features = ["full"] }
+
+[dev-dependencies]
+assert_cmd = "2.0.12"
+predicates = "3.0.3"
+
+[lib]
+name = "cipher"
+path = "src/lib.rs"
