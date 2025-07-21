@@ -10,6 +10,9 @@ clap = { version = "4.4.8", features = ["derive"] }
 anyhow = "1.0.75"
 ollama-rs = { version = "0.1.5", features = ["tokio"] }
 tokio = { version = "1", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+uuid = { version = "1.0", features = ["v4"] }
 
 [dev-dependencies]
 assert_cmd = "2.0.12"
