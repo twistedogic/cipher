@@ -1,6 +1,5 @@
-use anyhow::{Result};
+use anyhow::Result;
 use epub::doc::EpubDoc;
-use std::path::Path;
 use ollama_rs::Ollama;
 use ollama_rs::generation::completion::request::GenerationRequest;
 use serde::{Deserialize, Serialize};
@@ -8,105 +7,106 @@ use std::collections::HashMap;
 use std::fs;
 use uuid::Uuid;
 
-pub fn epub_to_markdown(path_str: &str) -> Result<Vec<String>> {
-    let path = Path::new(path_str);
-    let mut doc = EpubDoc::new(path).map_err(|e| anyhow::anyhow!("Failed to open EPUB file: {}", e))?;
-
-    let mut markdown_chunks = Vec::new();
-
-    let spine_ids: Vec<String> = doc.spine.iter().cloned().collect();
-    for (_idx, spine_item_id) in spine_ids.iter().enumerate() {
-        if let Ok(content_bytes_vec) = doc.get_resource(spine_item_id) {
-            let html_content = String::from_utf8_lossy(&content_bytes_vec);
-            let markdown = html2md::parse_html(&html_content);
-            markdown_chunks.push(markdown);
-        }
-    }
-
-    Ok(markdown_chunks)
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChunkData {
     pub id: String,
     pub content: String,
-    pub embedding: Vec<f64>,
+    pub embedding: Vec<f32>,
     pub metadata: HashMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VectorStore {
     pub chunks: Vec<ChunkData>,
-    pub index: HashMap<String, usize>,
+    pub embedding_dim: usize,
 }
 
 impl VectorStore {
-    pub fn new() -> Self {
+    pub fn new(embedding_dim: usize) -> Self {
         Self {
             chunks: Vec::new(),
-            index: HashMap::new(),
+            embedding_dim,
         }
     }
 
-    pub fn add_chunk(&mut self, content: String, embedding: Vec<f64>, metadata: HashMap<String, String>) -> String {
-        let id = Uuid::new_v4().to_string();
+    pub fn add_chunk(&mut self, content: String, embedding: Vec<f32>, metadata: HashMap<String, String>) {
         let chunk = ChunkData {
-            id: id.clone(),
+            id: Uuid::new_v4().to_string(),
             content,
             embedding,
             metadata,
         };
-        
-        let index = self.chunks.len();
         self.chunks.push(chunk);
-        self.index.insert(id.clone(), index);
-        
-        id
     }
 
-    pub fn similarity_search(&self, query_embedding: &[f64], top_k: usize) -> Vec<(f64, &ChunkData)> {
-        let mut similarities: Vec<(f64, &ChunkData)> = self.chunks
+    pub fn save_to_file(&self, file_path: &str) -> Result<()> {
+        let json = serde_json::to_string_pretty(self)?;
+        fs::write(file_path, json)?;
+        Ok(())
+    }
+
+    pub fn load_from_file(file_path: &str) -> Result<Self> {
+        let json = fs::read_to_string(file_path)?;
+        let store: VectorStore = serde_json::from_str(&json)?;
+        Ok(store)
+    }
+
+    pub fn search(&self, query_embedding: &[f32], top_k: usize) -> Vec<(f32, String)> {
+        let mut similarities: Vec<(f32, String)> = self
+            .chunks
             .iter()
             .map(|chunk| {
                 let similarity = cosine_similarity(query_embedding, &chunk.embedding);
-                (similarity, chunk)
+                (similarity, chunk.content.clone())
             })
             .collect();
 
         similarities.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
-        similarities.into_iter().take(top_k).collect()
-    }
-
-    pub fn save_to_file(&self, path: &str) -> Result<()> {
-        let json = serde_json::to_string_pretty(self)?;
-        fs::write(path, json)?;
-        Ok(())
-    }
-
-    pub fn load_from_file(path: &str) -> Result<Self> {
-        let json = fs::read_to_string(path)?;
-        let store: VectorStore = serde_json::from_str(&json)?;
-        Ok(store)
+        similarities.truncate(top_k);
+        similarities
     }
 }
 
-fn cosine_similarity(a: &[f64], b: &[f64]) -> f64 {
+fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     if a.len() != b.len() {
         return 0.0;
     }
 
-    let dot_product: f64 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
-    let norm_a: f64 = a.iter().map(|x| x * x).sum::<f64>().sqrt();
-    let norm_b: f64 = b.iter().map(|x| x * x).sum::<f64>().sqrt();
+    let dot_product: f32 = a.iter().zip(b.iter()).map(|(x, y)| x * y).sum();
+    let norm_a: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+    let norm_b: f32 = b.iter().map(|x| x * x).sum::<f32>().sqrt();
 
     if norm_a == 0.0 || norm_b == 0.0 {
-        0.0
-    } else {
-        dot_product / (norm_a * norm_b)
+        return 0.0;
     }
+
+    dot_product / (norm_a * norm_b)
 }
 
-pub async fn get_embeddings(markdown_chunks: Vec<String>) -> Result<Vec<Vec<f64>>> {
+pub fn epub_to_markdown(epub_path: &str) -> Result<Vec<String>> {
+    let mut doc = EpubDoc::new(epub_path)?;
+    let mut markdown_chunks = Vec::new();
+
+    for spine_id in doc.spine.clone() {
+        if let Ok(content) = doc.get_resource_str(&spine_id) {
+            let markdown = html2md::parse_html(&content);
+            if !markdown.trim().is_empty() {
+                // Split into chunks by paragraphs
+                let chunks: Vec<String> = markdown
+                    .split("\n\n")
+                    .filter(|chunk| !chunk.trim().is_empty() && chunk.len() > 50)
+                    .map(|s| s.to_string())
+                    .collect();
+                
+                markdown_chunks.extend(chunks);
+            }
+        }
+    }
+
+    Ok(markdown_chunks)
+}
+
+pub async fn get_embeddings(markdown_chunks: Vec<String>) -> Result<Vec<Vec<f32>>> {
     let ollama = Ollama::default();
     let mut embeddings = Vec::new();
 
@@ -115,57 +115,58 @@ pub async fn get_embeddings(markdown_chunks: Vec<String>) -> Result<Vec<Vec<f64>
             continue;
         }
 
-        let res = ollama.generate_embeddings("mxbai-embed-large".to_string(), chunk.to_string(), None).await;
-
-        if let Ok(res) = res {
-            embeddings.push(res.embeddings);
-        } else {
-            eprintln!("Failed to generate embeddings: {:?}", res);
-        }
+        let res = ollama.generate_embeddings("mxbai-embed-large".to_string(), chunk.to_string(), None).await?;
+        // Convert f64 to f32
+        let f32_embedding: Vec<f32> = res.embeddings.into_iter().map(|x| x as f32).collect();
+        embeddings.push(f32_embedding);
     }
 
     Ok(embeddings)
 }
 
-pub async fn get_single_embedding(text: &str) -> Result<Vec<f64>> {
+pub async fn get_single_embedding(text: &str) -> Result<Vec<f32>> {
     let ollama = Ollama::default();
     
     let res = ollama.generate_embeddings("mxbai-embed-large".to_string(), text.to_string(), None).await?;
-    Ok(res.embeddings)
+    // Convert f64 to f32
+    let f32_embedding: Vec<f32> = res.embeddings.into_iter().map(|x| x as f32).collect();
+    Ok(f32_embedding)
 }
 
 pub async fn create_vectorstore_from_epub(epub_path: &str, store_path: &str) -> Result<VectorStore> {
+    println!("Converting EPUB to markdown chunks...");
     let markdown_chunks = epub_to_markdown(epub_path)?;
+    println!("Generated {} markdown chunks", markdown_chunks.len());
+
+    println!("Generating embeddings...");
     let embeddings = get_embeddings(markdown_chunks.clone()).await?;
+    println!("Generated {} embeddings", embeddings.len());
+
+    let embedding_dim = embeddings.first().map(|e| e.len()).unwrap_or(0);
+    let mut store = VectorStore::new(embedding_dim);
     
-    let mut store = VectorStore::new();
-    
-    for (i, (chunk, embedding)) in markdown_chunks.into_iter().zip(embeddings.into_iter()).enumerate() {
-        if chunk.trim().is_empty() {
-            continue;
-        }
-        
+    for (i, (chunk, embedding)) in markdown_chunks.iter().zip(embeddings.iter()).enumerate() {
         let mut metadata = HashMap::new();
         metadata.insert("source".to_string(), epub_path.to_string());
         metadata.insert("chunk_index".to_string(), i.to_string());
         
-        store.add_chunk(chunk, embedding, metadata);
+        store.add_chunk(chunk.clone(), embedding.clone(), metadata);
     }
-    
+
     store.save_to_file(store_path)?;
+    println!("Vectorstore created successfully at: {}", store_path);
+
     Ok(store)
 }
 
-pub async fn query_vectorstore(store: &VectorStore, query: &str, top_k: usize) -> Result<Vec<(f64, String)>> {
+pub async fn query_vectorstore(store_path: &str, query: &str, top_k: usize) -> Result<Vec<(f32, String)>> {
     let query_embedding = get_single_embedding(query).await?;
-    let results = store.similarity_search(&query_embedding, top_k);
-    
-    Ok(results.into_iter().map(|(score, chunk)| (score, chunk.content.clone())).collect())
+    let store = VectorStore::load_from_file(store_path)?;
+    Ok(store.search(&query_embedding, top_k))
 }
 
 pub async fn rag_query(store_path: &str, query: &str, top_k: usize) -> Result<String> {
-    let store = VectorStore::load_from_file(store_path)?;
-    let relevant_chunks = query_vectorstore(&store, query, top_k).await?;
+    let relevant_chunks = query_vectorstore(store_path, query, top_k).await?;
     
     let context: String = relevant_chunks
         .iter()

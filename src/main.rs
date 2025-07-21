@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use cipher::{epub_to_markdown, get_embeddings, create_vectorstore_from_epub, rag_query};
+use cipher::{epub_to_markdown, get_embeddings, create_vectorstore_from_epub, rag_query, query_vectorstore};
 
 #[derive(Parser, Debug)]
 #[clap(author, version, about, long_about = None)]
@@ -21,8 +21,16 @@ enum Commands {
         #[arg(short, long, default_value = "vectorstore.json")]
         output: String,
     },
+    /// Search the vectorstore for similar content
+    Search {
+        #[arg(short, long, default_value = "vectorstore.json")]
+        store_path: String,
+        query: String,
+        #[arg(short, long, default_value = "5")]
+        top_k: usize,
+    },
     /// Query the vectorstore using RAG
-    Query {
+    Rag {
         #[arg(short, long, default_value = "vectorstore.json")]
         store_path: String,
         query: String,
@@ -46,11 +54,20 @@ async fn main() -> Result<()> {
         }
         Commands::Index { epub_path, output } => {
             println!("Creating vectorstore from EPUB: {}", epub_path);
-            let store = create_vectorstore_from_epub(&epub_path, &output).await?;
-            println!("Vectorstore created with {} chunks and saved to: {}", store.chunks.len(), output);
+            let _store = create_vectorstore_from_epub(&epub_path, &output).await?;
+            println!("Vectorstore created successfully at: {}", output);
         }
-        Commands::Query { store_path, query, top_k } => {
-            println!("Querying vectorstore: {}", store_path);
+        Commands::Search { store_path, query, top_k } => {
+            println!("Searching vectorstore: {}", store_path);
+            println!("Query: {}", query);
+            let results = query_vectorstore(&store_path, &query, top_k).await?;
+            println!("\nSearch Results:");
+            for (i, (score, content)) in results.iter().enumerate() {
+                println!("{}. Score: {:.3}\n{}\n", i + 1, score, content);
+            }
+        }
+        Commands::Rag { store_path, query, top_k } => {
+            println!("RAG query on vectorstore: {}", store_path);
             println!("Query: {}", query);
             let answer = rag_query(&store_path, &query, top_k).await?;
             println!("\nAnswer:\n{}", answer);
